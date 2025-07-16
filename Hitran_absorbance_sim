@@ -1,0 +1,61 @@
+from hapi import *
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+# Initialize HITRAN database
+db_begin("data")
+
+# O2 parameters
+gas = "O2"
+ID = 7  # HITRAN molecule ID for O2
+isotopologue = 1
+ppm = 210000  # O2 at 210,000 ppm = 21%
+mole_fraction = ppm / 1e6
+
+# Simulation parameters
+wavenumber_min = 833  # cm⁻¹ (12 µm)
+wavenumber_max = 3333  # cm⁻¹ (3 µm)
+resolution = 0.01  # cm⁻¹
+temperature = 296  # K
+pressure = 1.0  # atm
+path_length = 1.0  # m
+
+# Download O2 line data
+fetch(gas, ID, isotopologue, wavenumber_min, wavenumber_max)
+
+# Master wavenumber and wavelength grid
+nu_master = np.arange(wavenumber_min, wavenumber_max, resolution)
+wavelength_master = 1e4 / nu_master  # µm
+
+# Calculate Voigt-profile absorption coefficient
+nu, absorb = absorptionCoefficient_Voigt(
+    SourceTables=gas,
+    OmegaStep=resolution,
+    OmegaRange=(wavenumber_min, wavenumber_max),
+    HITRAN_units=False,
+)
+
+# Interpolate to master grid
+interp_func = interp1d(nu, absorb, kind="linear", bounds_error=False, fill_value=0)
+absorb_interp = interp_func(nu_master)
+
+# Convert mole fraction to partial pressure (atm)
+concentration = mole_fraction * pressure
+
+# Calculate absorbance using Beer-Lambert Law
+absorbance = absorb_interp * concentration * path_length
+
+# Plot
+plt.figure(figsize=(12, 5))
+plt.plot(wavelength_master, absorbance, color="darkred", label=f"O₂ ({ppm:,} ppm)")
+plt.title("Simulated O₂ Absorbance (3–12 µm, 296 K, 1 atm, 1 m path)")
+plt.xlabel("Wavelength [µm]")
+plt.ylabel("Absorbance")
+plt.xlim(3, 12)
+plt.ylim(0, np.max(absorbance) * 1.1 if np.max(absorbance) > 0 else 1e-6)
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.gca().invert_xaxis()
+plt.show()
