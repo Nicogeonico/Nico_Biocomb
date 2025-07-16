@@ -1,0 +1,55 @@
+import os
+import pandas as pd
+
+# === Directories ===
+input_dir = r"C:\Users\Nico\Desktop\cross_sections\for_conversion"
+output_dir = r"C:\Users\Nico\Desktop\cross_sections\Final_Abs_data_for_graph"
+
+# === Constants ===
+path_length_cm = 7  # cm
+air_number_density = 2.5e19  # molecules/cm³
+
+# === Molecule-specific ppm values (Lactic acid excluded)
+molecule_ppm = {
+    "Ethanol": 100,
+    "Acetic_acid": 500,
+    "Butyric_acid": 250,
+    "Formic_acid": 250,
+    "Hexanoic_acid": 100,
+}
+
+# === Process all CSVs ===
+for file in os.listdir(input_dir):
+    if not file.endswith(".csv"):
+        continue
+
+    file_path = os.path.join(input_dir, file)
+    output_path = os.path.join(output_dir, file.replace(".csv", "_converted.xlsx"))
+
+    # Try to extract the molecule name by removing known suffixes
+    filename_core = file.replace("_final.csv", "").replace(".csv", "")
+
+    if filename_core not in molecule_ppm:
+        print(f"⚠️ Skipping {file}: no concentration defined for '{filename_core}'")
+        continue
+
+    ppm = molecule_ppm[filename_core]
+    mixing_ratio = ppm * 1e-6
+    number_density = air_number_density * mixing_ratio
+
+    # Load data
+    df = pd.read_csv(file_path)
+    print(f"📄 Processing {file}...")
+
+    # Add wavelength columns
+    df["Wavelength (µm)"] = 1e4 / df["Wavenumber (cm⁻¹)"]
+    df["Wavelength (nm)"] = 1e7 / df["Wavenumber (cm⁻¹)"]
+
+    # Convert cross-section to absorbance
+    df["Absorbance"] = (
+        df["CrossSection (cm²/molecule)"] * number_density * path_length_cm
+    )
+
+    # Save
+    df.to_excel(output_path, index=False, engine="openpyxl")
+    print(f"✅ Saved to: {output_path}")
