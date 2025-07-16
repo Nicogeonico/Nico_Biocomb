@@ -1,0 +1,54 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# === Folder where converted Excel files are stored ===
+folder_path = r"C:\Users\Nico\Desktop\cross_sections\Final_Abs_data_for_graph"
+
+# === Initialize plot ===
+plt.figure(figsize=(12, 7))
+plt.title("Absorbance Spectra of Volatile Acids and Alcohols")
+plt.xlabel("Wavelength (µm)")
+plt.ylabel("Absorbance (unitless)")
+plt.grid(True, linestyle="--", linewidth=0.5)
+
+# === Loop through all files in the folder ===
+for filename in os.listdir(folder_path):
+    if filename.endswith(".xlsx") or filename.endswith(".csv"):
+        file_path = os.path.join(folder_path, filename)
+
+        # Load file
+        if filename.endswith(".csv"):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path, engine="openpyxl")
+
+        # Clean molecule name from filename
+        molecule_name = (
+            os.path.splitext(filename)[0].replace("_converted", "").replace("_", " ")
+        )
+
+        # Check that required columns are present
+        if "Wavelength (µm)" not in df.columns or "Absorbance" not in df.columns:
+            print(f"⚠️ Skipping {molecule_name}: required columns not found")
+            continue
+
+        # Plot absorbance vs wavelength (in µm)
+        plt.plot(
+            df["Wavelength (µm)"],
+            df["Absorbance"],
+            label=molecule_name,
+            linewidth=1.5,
+        )
+
+        # === Print peak absorbance ===
+        peak_abs = df["Absorbance"].max()
+        peak_wavelength = df.loc[df["Absorbance"].idxmax(), "Wavelength (µm)"]
+        print(
+            f"🔍 {molecule_name}: Max Absorbance = {peak_abs:.3e} at {peak_wavelength:.2f} µm"
+        )
+
+# === Finalize plot ===
+plt.legend()
+plt.tight_layout()
+plt.show()
