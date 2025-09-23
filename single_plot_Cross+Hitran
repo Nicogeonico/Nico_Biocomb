@@ -1,0 +1,287 @@
+import os
+import shutil
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+# === HITRAN (HAPI) ===
+from hapi import db_begin, fetch, absorptionCoefficient_Voigt, dropTable, tableList
+
+# ==============================
+# User paths & core parameters
+# ==============================
+input_dir  = r"C:\Users\nicog\OneDrive\Desktop\cross_sections\for_conversion"
+output_dir = r"C:\Users\nicog\OneDrive\Desktop\cross_sections\Final_Abs_data_for_graph"
+
+# Cross-section → absorbance (Beer–Lambert: A = σ * N * L)
+path_length_cm = 300           # cm
+air_number_density = 2.5e19  # molecules/cm^3
+
+# Cross-section files ppm (keys match filenames after removing "_final")
+molecule_ppm = {
+    "Ethanol": 1000,
+    "Acetic_acid": 2,
+    "Butyric_acid": 1,
+    "Hexanoic_acid": 0.8,
+    # Add more, e.g.: "Lactic_acid": 0.5,
+}
+
+# HITRAN settings
+hapi_db_dir = r"C:\Users\nicog\OneDrive\Desktop\hapi_cache_fresh"
+# Use 'hapi_name' for HAPI table; 'label' for legend text
+hitran_molecules = {
+    "CO2":         {"hapi_name": "CO2",   "ID": 2,  "ppm": 500000, "alpha": 0.55},  # 50%
+    "CH4":         {"hapi_name": "CH4",   "ID": 6,  "ppm": 50000,  "alpha": 0.55},  # 5%
+    "H2O":         {"hapi_name": "H2O",   "ID": 1,  "ppm": 0.2,    "alpha": 0.55},  # very dry
+    "Formic acid": {"hapi_name": "HCOOH", "ID": 28, "ppm": 0.05,   "alpha": 1.00},  # label pretty; HAPI=HCOOH
+}
+
+wavenumber_min = 833    # cm^-1
+wavenumber_max = 3333   # cm^-1
+resolution = 0.01       # cm^-1
+pressure_atm = 1.0      # atm
+path_length_m = 3       # meters (HITRAN panel)
+xlim_um = (3.0, 12.0)
+
+# Choose a small y-limit so large species get clipped and small features are visible
+ymax = 0.02  # adjust to taste
+
+
+# ==============================
+# Guards & helpers
+# ==============================
+def ensure_writable_dir(path: str) -> str:
+    path = os.path.normpath(path)
+    print(f"[path-check] output_dir = {path}")
+    os.makedirs(path, exist_ok=True)
+    test_file = os.path.join(path, "_write_test.tmp")
+    with open(test_file, "w") as f:
+        f.write("ok")
+    os.remove(test_file)
+    return path
+
+
+def safe_db_begin(dbdir: str):
+    dbdir = os.path.normpath(dbdir)
+    os.makedirs(dbdir, exist_ok=True)
+    try:
+        db_begin(dbdir)
+    except Exception as e:
+        print(f"[HAPI] db_begin failed on '{dbdir}' -> {e}\n[HAPI] Recreating a fresh DB dir...")
+        try:
+            shutil.rmtree(dbdir, ignore_errors=True)
+            os.makedirs(dbdir, exist_ok=True)
+            db_begin(dbdir)
+        except Exception as e2:
+            raise RuntimeError(f"[HAPI] Could not recover DB dir '{dbdir}': {e2}")
+
+
+def fetch_clean(name: str, gas_id: int, isotopologue: int, wn_min: float, wn_max: float):
+    try:
+        if name in tableList():
+            try:
+                dropTable(name)
+                print(f"[HAPI] Dropped existing table '{name}'")
+            except Exception as e:
+                print(f"[HAPI] Warning: could not drop '{name}': {e}")
+        fetch(name, gas_id, isotopologue, wn_min, wn_max)
+    except Exception as e:
+        print(f"[HAPI] Fetch error for '{name}': {e}\n[HAPI] Retrying once with a clean table...")
+        try:
+            if name in tableList():
+                dropTable(name)
+        except Exception:
+            pass
+        fetch(name, gas_id, isotopologue, wn_min, wn_max)
+
+
+def infer_molecule_key(filename: str) -> str:
+    core = filename
+    if core.lower().endswith(".csv"):  core = core[:-4]
+    if core.lower().endswith(".xlsx"): core = core[:-5]
+    if core.endswith("_final"):        core = core[:-6]
+    return core
+
+
+def fmt_ppm(x: float) -> str:
+    """Readable ppm (no trailing zeros)."""
+    if x >= 1000:
+        return f"{int(x):,}"
+    # Keep up to 3 decimals for tiny values
+    s = f"{x:.3f}".rstrip("0").rstrip(".")
+    return s
+
+
+def convert_cross_section_folder(input_dir, output_dir, path_length_cm, air_number_density, molecule_ppm):
+    ensure_writable_dir(output_dir)
+    converted_data = []
+
+    for file in os.listdir(input_dir):
+        if not file.lower().endswith(".csv"):
+            continue
+
+        inferred_key = infer_molecule_key(file)
+        if inferred_key not in molecule_ppm:
+            print(f"⚠️ Skipping {file}: no ppm defined for '{inferred_key}'")
+            continue
+
+        input_path = os.path.join(input_dir, file)
+        out_name = file.replace(".csv", "_converted.xlsx")
+        output_path = os.path.join(output_dir, out_name)
+
+        ppm = float(molecule_ppm[inferred_key])
+        mixing_ratio = ppm * 1e-6
+        number_density = air_number_density * mixing_ratio
+
+        df = pd.read_csv(input_path)
+        needed_cols = ["Wavenumber (cm⁻¹)", "CrossSection (cm²/molecule)"]
+        if not all(c in df.columns for c in needed_cols):
+            print(f"⚠️ Skipping {file}: missing required columns {needed_cols}")
+            continue
+
+        print(f"📄 Processing {file} → {out_name}  (ppm={ppm})")
+
+        wn = df["Wavenumber (cm⁻¹)"].astype(float).replace(0, np.nan)
+        df["Wavelength (µm)"] = 1e4 / wn
+        df["Wavelength (nm)"] = 1e7 / wn
+
+        sigma = df["CrossSection (cm²/molecule)"].astype(float)
+        df["Absorbance"] = sigma * number_density * path_length_cm
+
+        try:
+            df.to_excel(output_path, index=False, engine="openpyxl")
+        except Exception as e:
+            print(f"⚠️ Could not write {out_name}: {e}")
+
+        df_plot = df.dropna(subset=["Wavelength (µm)", "Absorbance"]).copy()
+        df_plot = df_plot[(df_plot["Wavelength (µm)"] >= xlim_um[0]) &
+                          (df_plot["Wavelength (µm)"] <= xlim_um[1])]
+
+        molecule_display = inferred_key.replace("_", " ")
+        converted_data.append((molecule_display, ppm, df_plot))
+
+    return converted_data
+
+
+def simulate_hitran_panel(hitran_molecules, wavenumber_min, wavenumber_max, resolution, pressure_atm, path_length_m):
+    safe_db_begin(hapi_db_dir)
+
+    nu_master = np.arange(wavenumber_min, wavenumber_max, resolution)  # cm^-1
+    wavelength_um = 1e4 / nu_master
+    traces = {}
+
+    print("\n📡 HITRAN-based simulations (linear scale, no N2/O2):")
+    for label, info in hitran_molecules.items():
+        gas_name = info["hapi_name"]
+        gas_id = info["ID"]
+        ppm = float(info["ppm"])
+        mole_fraction = ppm * 1e-6
+        isotopologue = 1
+
+        # Heads-up prints for surprising values
+        if gas_name == "H2O" and ppm < 100:
+            print(f"[note] H2O at {ppm} ppm is extremely dry.")
+        if gas_name == "CH4":
+            print(f"[note] CH4 set to {ppm:,} ppm (= {ppm/1e4:.2f}%).")
+
+        print(f"→ {label} (HAPI:{gas_name}): {ppm} ppm")
+        fetch_clean(gas_name, gas_id, isotopologue, wavenumber_min, wavenumber_max)
+
+        nu, k_nu = absorptionCoefficient_Voigt(
+            SourceTables=gas_name,
+            OmegaStep=resolution,
+            OmegaRange=(wavenumber_min, wavenumber_max),
+            HITRAN_units=False,
+        )
+
+        interp_k = interp1d(nu, k_nu, kind="linear", bounds_error=False, fill_value=0.0)
+        k_master = interp_k(nu_master)
+
+        absorbance = k_master * (mole_fraction * pressure_atm) * path_length_m
+        traces[label] = {
+            "wavelength_um": wavelength_um,
+            "absorbance": absorbance,
+            "ppm": ppm,
+            "alpha": info.get("alpha", 1.0),
+        }
+
+    return traces
+
+
+# ==============================
+# Main flow
+# ==============================
+if __name__ == "__main__":
+    # 1) Convert cross-sections → absorbance (and save)
+    converted = convert_cross_section_folder(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        path_length_cm=path_length_cm,
+        air_number_density=air_number_density,
+        molecule_ppm=molecule_ppm,
+    )
+
+    # 2) Simulate HITRAN traces
+    hitran_traces = simulate_hitran_panel(
+        hitran_molecules=hitran_molecules,
+        wavenumber_min=wavenumber_min,
+        wavenumber_max=wavenumber_max,
+        resolution=resolution,
+        pressure_atm=pressure_atm,
+        path_length_m=path_length_m,
+    )
+
+    # 3) Single combined plot
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # --- Plot large-background gases first (semi-transparent) ---
+    background_order = ["CO2", "CH4", "H2O"]
+    for name in background_order:
+        if name in hitran_traces:
+            d = hitran_traces[name]
+            ax.plot(
+                d["wavelength_um"], d["absorbance"],
+                label=f"{name} ({fmt_ppm(d['ppm'])} ppm)",
+                linewidth=1.0,
+                alpha=d.get("alpha", 0.6),
+                zorder=1
+            )
+
+    # --- Plot the rest of HITRAN on top (fully opaque unless alpha set) ---
+    for name, d in hitran_traces.items():
+        if name in background_order:
+            continue
+        ax.plot(
+            d["wavelength_um"], d["absorbance"],
+            label=f"{name} ({fmt_ppm(d['ppm'])} ppm)",
+            linewidth=1.2,
+            alpha=d.get("alpha", 1.0),
+            zorder=3
+        )
+
+    # --- Plot cross-section molecules last so their small features are visible ---
+    print("\n🧪 Cross-section curves (converted & overlaid):")
+    for mol_name, ppm, df_plot in converted:
+        if df_plot.empty:
+            print(f"⚠️ {mol_name}: no points in {xlim_um[0]}–{xlim_um[1]} µm")
+            continue
+        ax.plot(
+            df_plot["Wavelength (µm)"].values,
+            df_plot["Absorbance"].values,
+            label=f"{mol_name} ({fmt_ppm(ppm)} ppm)",
+            linewidth=1.4,
+            zorder=4
+        )
+        print(f"→ {mol_name}: plotted {len(df_plot)} points")
+
+    ax.set_title("Absorbance (3–12 µm): HITRAN + Cross-section Molecules")
+    ax.set_xlabel("Wavelength [µm]")
+    ax.set_ylabel("Absorbance (unitless)")
+    ax.set_xlim(*xlim_um)
+    ax.set_ylim(0, ymax)  # <<< small cap so big features clip, revealing small ones
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    ax.legend(loc="upper right", fontsize=9, ncol=1)
+
+    plt.tight_layout()
+    plt.show()
